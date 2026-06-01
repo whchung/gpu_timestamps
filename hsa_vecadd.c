@@ -37,7 +37,8 @@
 /* ── Configuration ──────────────────────────────────────────────── */
 
 #define WORKGROUP_SIZE   256
-#define DEFAULT_N        1024
+#define NUM_WORKGROUPS   8
+#define DEFAULT_N        (WORKGROUP_SIZE * NUM_WORKGROUPS)
 #define DEFAULT_RUNS     10
 #define CO_FILE          "vecadd_kernel.co"
 #define KERNEL_SYM       "vecadd_timestamp.kd"
@@ -70,6 +71,10 @@ typedef struct {
 
     uint64_t shader_start;
     uint64_t shader_end;
+
+    /* Per-workgroup shader timestamps */
+    uint64_t wg_shader_start[NUM_WORKGROUPS];
+    uint64_t wg_shader_end[NUM_WORKGROUPS];
 } ts_record_t;
 
 /* ── SDMA timestamp record ──────────────────────────────────────── */
@@ -437,9 +442,15 @@ static void run_sequential(hsa_queue_t *queue, const kernel_info_t *ki,
                   hsa_amd_profiling_convert_tick_to_system_domain(
                       g_gpu, cp_time.end, &records[r].cp_end_sys));
 
-        /* Timestamp point 3: shader s_memrealtime (workgroup 0) */
+        /* Timestamp point 3: shader s_memrealtime (workgroup 0 for backward compat) */
         records[r].shader_start = ts_shader[0];
         records[r].shader_end   = ts_shader[1];
+
+        /* Store per-workgroup timestamps */
+        for (uint32_t wg = 0; wg < num_groups && wg < NUM_WORKGROUPS; wg++) {
+            records[r].wg_shader_start[wg] = ts_shader[wg * 2];
+            records[r].wg_shader_end[wg]   = ts_shader[wg * 2 + 1];
+        }
 
         hsa_signal_destroy(signal);
         hsa_amd_memory_pool_free(kernarg);
@@ -513,6 +524,12 @@ static void run_burst(hsa_queue_t *queue, const kernel_info_t *ki,
 
         records[r].shader_start = ts_bufs[r][0];
         records[r].shader_end   = ts_bufs[r][1];
+
+        /* Store per-workgroup timestamps */
+        for (uint32_t wg = 0; wg < num_groups && wg < NUM_WORKGROUPS; wg++) {
+            records[r].wg_shader_start[wg] = ts_bufs[r][wg * 2];
+            records[r].wg_shader_end[wg]   = ts_bufs[r][wg * 2 + 1];
+        }
     }
 
     /* Pass 2: Convert ticks to system domain AFTER all raw reads. */
@@ -578,6 +595,24 @@ static void print_records(const ts_record_t *recs, int n) {
     }
 }
 
+/* ── Print per-workgroup timestamps ─────────────────────────────── */
+
+static void print_per_workgroup_timestamps(const ts_record_t *rec, int run_num) {
+    printf("\n━━━ Run %d: Per-Workgroup Timestamps ━━━\n", run_num);
+    printf("  CP: start=%lu, end=%lu (duration=%lu ticks)\n",
+           rec->cp_start, rec->cp_end, rec->cp_end - rec->cp_start);
+    printf("\n  %3s  %20s  %20s  %15s\n",
+           "WG", "Shader_Start", "Shader_End", "Duration");
+
+    for (int wg = 0; wg < NUM_WORKGROUPS; wg++) {
+        uint64_t start = rec->wg_shader_start[wg];
+        uint64_t end = rec->wg_shader_end[wg];
+        uint64_t dur = (start != 0 && end > start) ? (end - start) : 0;
+
+        printf("  %3d  %20lu  %20lu  %15lu\n", wg, start, end, dur);
+    }
+}
+
 /* ── Overlap detection ──────────────────────────────────────────── */
 
 static int check_overlaps(const char *label, const ts_record_t *recs, int n) {
@@ -640,13 +675,12 @@ int main(int argc, char **argv) {
     setbuf(stderr, NULL);
 
     int num_runs = DEFAULT_RUNS;
-    int N        = DEFAULT_N;
     if (argc > 1) num_runs = atoi(argv[1]);
-    if (argc > 2) N        = atoi(argv[2]);
     if (num_runs < 1) num_runs = 1;
-    if (N < 1) N = DEFAULT_N;
 
-    uint32_t num_groups = (N + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
+    /* Force exactly 8 workgroups */
+    uint32_t num_groups = NUM_WORKGROUPS;
+    int N = WORKGROUP_SIZE * num_groups;
 
     printf("╔══════════════════════════════════════════════════════════╗\n");
     printf("║  Bare-Metal HSA Timestamp Validation Test (Zero HIP)   ║\n");
@@ -733,6 +767,11 @@ int main(int argc, char **argv) {
     run_sequential(queue, &ki, A, B, C, N, num_groups, num_runs, seq_recs);
     print_records(seq_recs, num_runs);
 
+    /* Print per-workgroup timestamps for first run */
+    if (num_runs > 0) {
+        print_per_workgroup_timestamps(&seq_recs[0], 0);
+    }
+
     printf("\n  ── Sequential overlap analysis ──\n");
     int seq_overlaps = check_overlaps("SEQ", seq_recs, num_runs);
     if (seq_overlaps == 0)
@@ -756,6 +795,11 @@ int main(int argc, char **argv) {
     memset(C, 0, data_bytes);
     run_burst(queue, &ki, A, B, C, N, num_groups, num_runs, burst_recs);
     print_records(burst_recs, num_runs);
+
+    /* Print per-workgroup timestamps for first run */
+    if (num_runs > 0) {
+        print_per_workgroup_timestamps(&burst_recs[0], 0);
+    }
 
     printf("\n  ── Burst overlap analysis ──\n");
     int burst_overlaps = check_overlaps("BURST", burst_recs, num_runs);
