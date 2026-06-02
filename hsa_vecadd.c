@@ -1,15 +1,20 @@
 /*
- * hsa_vecadd.c — Bare-Metal HSA Timestamp Validation Test
+ * hsa_vecadd.c — Bare-Metal HSA Dual-Clock Timestamp Measurement
  *
  * Pure C.  Links only against libhsa-runtime64.  Zero HIP dependency.
  * The kernel is compiled with clang --target=amdgcn-amd-amdhsa,
- * using only hardware intrinsics and s_memrealtime shader timestamps.
+ * using only hardware intrinsics.
  *
- * Collects timestamps from 4 observation points:
- *   1. HSA system clock     (host-side, before/after dispatch)
+ * Single-wave measurement protocol:
+ *   1. Shader captures s_memrealtime + s_memtime (store locally)
+ *   2. Store out, waitcnt, barrier (no other work)
+ *   3. Shader captures s_memrealtime + s_memtime again
+ *   4. Store out
+ *
+ * Collects timestamps from:
+ *   1. HSA system clock (host-side, before/after dispatch)
  *   2. CP completion signal (hsa_amd_profiling_get_dispatch_time)
- *   3. Shader s_memrealtime (per-workgroup start/end inside kernel)
- *   4. SDMA async-copy      (hsa_amd_profiling_get_async_copy_time)
+ *   3. Shader dual clocks (s_memrealtime + s_memtime, before/after barrier)
  *
  * Two dispatch patterns:
  *   - Sequential: dispatch-wait-dispatch-wait (baseline)
@@ -69,12 +74,11 @@ typedef struct {
     uint64_t cp_start_sys;
     uint64_t cp_end_sys;
 
-    uint64_t shader_start;
-    uint64_t shader_end;
-
-    /* Per-workgroup shader timestamps */
-    uint64_t wg_shader_start[NUM_WORKGROUPS];
-    uint64_t wg_shader_end[NUM_WORKGROUPS];
+    /* Shader dual-clock measurements (single wave) */
+    uint64_t shader_realtime_1;
+    uint64_t shader_cycles_1;
+    uint64_t shader_realtime_2;
+    uint64_t shader_cycles_2;
 } ts_record_t;
 
 /* ── SDMA timestamp record ──────────────────────────────────────── */
@@ -101,6 +105,12 @@ typedef struct {
  *   offset 24: uint64_t* ts_shader   (8 bytes)
  *   offset 32: uint32_t N            (4 bytes)
  *   total: 36 bytes (no HIP implicit arguments)
+ *
+ * ts_shader buffer layout (4 uint64_t values):
+ *   [0] = realtime_1
+ *   [1] = cycles_1
+ *   [2] = realtime_2
+ *   [3] = cycles_2
  */
 
 /* ── Global state ───────────────────────────────────────────────── */
@@ -269,6 +279,9 @@ static void init_hsa(void) {
     HSA_CHECK("sys_freq",
               hsa_system_get_info(HSA_SYSTEM_INFO_TIMESTAMP_FREQUENCY, &g_sys_freq));
 
+    // HARD code g_sys_freq as 100MHz
+    g_sys_freq = 100.0 * 1e6;
+
     printf("Memory pools: kernarg=OK  fine-grained=OK  VRAM=%s\n",
            g_have_vram ? "OK" : "N/A");
     printf("System timestamp frequency: %lu Hz (%.1f MHz)\n",
@@ -388,7 +401,7 @@ static void run_sequential(hsa_queue_t *queue, const kernel_info_t *ki,
                             float *A, float *B, float *C,
                             uint32_t N, uint32_t num_groups,
                             int num_runs, ts_record_t *records) {
-    size_t ts_bytes = (size_t)num_groups * 2 * sizeof(uint64_t);
+    size_t ts_bytes = 4 * sizeof(uint64_t);  /* 4 values: realtime1, cycles1, realtime2, cycles2 */
 
     for (int r = 0; r < num_runs; r++) {
         /* Per-dispatch shader timestamp buffer */
@@ -442,15 +455,11 @@ static void run_sequential(hsa_queue_t *queue, const kernel_info_t *ki,
                   hsa_amd_profiling_convert_tick_to_system_domain(
                       g_gpu, cp_time.end, &records[r].cp_end_sys));
 
-        /* Timestamp point 3: shader s_memrealtime (workgroup 0 for backward compat) */
-        records[r].shader_start = ts_shader[0];
-        records[r].shader_end   = ts_shader[1];
-
-        /* Store per-workgroup timestamps */
-        for (uint32_t wg = 0; wg < num_groups && wg < NUM_WORKGROUPS; wg++) {
-            records[r].wg_shader_start[wg] = ts_shader[wg * 2];
-            records[r].wg_shader_end[wg]   = ts_shader[wg * 2 + 1];
-        }
+        /* Timestamp point 3: shader dual-clock measurements */
+        records[r].shader_realtime_1 = ts_shader[0];
+        records[r].shader_cycles_1   = ts_shader[1];
+        records[r].shader_realtime_2 = ts_shader[2];
+        records[r].shader_cycles_2   = ts_shader[3];
 
         hsa_signal_destroy(signal);
         hsa_amd_memory_pool_free(kernarg);
@@ -464,7 +473,7 @@ static void run_burst(hsa_queue_t *queue, const kernel_info_t *ki,
                        float *A, float *B, float *C,
                        uint32_t N, uint32_t num_groups,
                        int num_runs, ts_record_t *records) {
-    size_t ts_bytes = (size_t)num_groups * 2 * sizeof(uint64_t);
+    size_t ts_bytes = 4 * sizeof(uint64_t);  /* 4 values: realtime1, cycles1, realtime2, cycles2 */
 
     hsa_signal_t *signals  = calloc(num_runs, sizeof(hsa_signal_t));
     void        **kernargs = calloc(num_runs, sizeof(void *));
@@ -522,14 +531,11 @@ static void run_burst(hsa_queue_t *queue, const kernel_info_t *ki,
         records[r].cp_start = cp.start;
         records[r].cp_end   = cp.end;
 
-        records[r].shader_start = ts_bufs[r][0];
-        records[r].shader_end   = ts_bufs[r][1];
-
-        /* Store per-workgroup timestamps */
-        for (uint32_t wg = 0; wg < num_groups && wg < NUM_WORKGROUPS; wg++) {
-            records[r].wg_shader_start[wg] = ts_bufs[r][wg * 2];
-            records[r].wg_shader_end[wg]   = ts_bufs[r][wg * 2 + 1];
-        }
+        /* Shader dual-clock measurements */
+        records[r].shader_realtime_1 = ts_bufs[r][0];
+        records[r].shader_cycles_1   = ts_bufs[r][1];
+        records[r].shader_realtime_2 = ts_bufs[r][2];
+        records[r].shader_cycles_2   = ts_bufs[r][3];
     }
 
     /* Pass 2: Convert ticks to system domain AFTER all raw reads. */
@@ -581,35 +587,50 @@ static void sdma_copy_profiled(void *dst, hsa_agent_t dst_agent,
 static void print_records(const ts_record_t *recs, int n) {
     double to_us = 1e6 / (double)g_sys_freq;
 
-    printf("  %4s  %20s  %20s  %10s  %20s  %20s  %12s\n",
+    printf("  %4s  %20s  %20s  %10s  %15s  %15s  %15s  %15s\n",
            "Run", "CP_start", "CP_end", "CP(us)",
-           "shader_start", "shader_end", "shader_tks");
+           "RT_delta", "CYC_delta", "RT1", "CYC1");
 
     for (int i = 0; i < n; i++) {
         const ts_record_t *r = &recs[i];
         double cp_dur = (double)(r->cp_end - r->cp_start) * to_us;
-        printf("  %4d  %20lu  %20lu  %10.1f  %20lu  %20lu  %12lu\n",
+        uint64_t rt_delta = r->shader_realtime_2 - r->shader_realtime_1;
+        uint64_t cyc_delta = r->shader_cycles_2 - r->shader_cycles_1;
+
+        printf("  %4d  %20lu  %20lu  %10.1f  %15lu  %15lu  %15lu  %15lu\n",
                i, r->cp_start, r->cp_end, cp_dur,
-               r->shader_start, r->shader_end,
-               r->shader_end - r->shader_start);
+               rt_delta, cyc_delta,
+               r->shader_realtime_1, r->shader_cycles_1);
     }
 }
 
-/* ── Print per-workgroup timestamps ─────────────────────────────── */
+/* ── Print detailed dual-clock measurements ─────────────────────── */
 
-static void print_per_workgroup_timestamps(const ts_record_t *rec, int run_num) {
-    printf("\n━━━ Run %d: Per-Workgroup Timestamps ━━━\n", run_num);
-    printf("  CP: start=%lu, end=%lu (duration=%lu ticks)\n",
-           rec->cp_start, rec->cp_end, rec->cp_end - rec->cp_start);
-    printf("\n  %3s  %20s  %20s  %15s\n",
-           "WG", "Shader_Start", "Shader_End", "Duration");
+static void print_dual_clock_detail(const ts_record_t *rec, int run_num) {
+    printf("\n━━━ Run %d: Dual-Clock Measurement Detail ━━━\n", run_num);
+    printf("  CP timestamps:\n");
+    printf("    start = %lu\n", rec->cp_start);
+    printf("    end   = %lu\n", rec->cp_end);
+    printf("    delta = %lu ticks\n\n", rec->cp_end - rec->cp_start);
 
-    for (int wg = 0; wg < NUM_WORKGROUPS; wg++) {
-        uint64_t start = rec->wg_shader_start[wg];
-        uint64_t end = rec->wg_shader_end[wg];
-        uint64_t dur = (start != 0 && end > start) ? (end - start) : 0;
+    printf("  Shader timestamps (single wave):\n");
+    printf("    Measurement #1 (before barrier):\n");
+    printf("      s_memrealtime = %lu\n", rec->shader_realtime_1);
+    printf("      s_memtime     = %lu\n", rec->shader_cycles_1);
+    printf("    Measurement #2 (after barrier):\n");
+    printf("      s_memrealtime = %lu\n", rec->shader_realtime_2);
+    printf("      s_memtime     = %lu\n\n", rec->shader_cycles_2);
 
-        printf("  %3d  %20lu  %20lu  %15lu\n", wg, start, end, dur);
+    uint64_t rt_delta = rec->shader_realtime_2 - rec->shader_realtime_1;
+    uint64_t cyc_delta = rec->shader_cycles_2 - rec->shader_cycles_1;
+
+    printf("  Delta (measurement #2 - #1):\n");
+    printf("    s_memrealtime delta = %lu ticks\n", rt_delta);
+    printf("    s_memtime delta     = %lu cycles\n", cyc_delta);
+
+    if (cyc_delta > 0 && rt_delta > 0) {
+        double ratio = (double)cyc_delta / (double)rt_delta;
+        printf("    cycles/realtime ratio = %.6f\n", ratio);
     }
 }
 
@@ -632,11 +653,11 @@ static int check_overlaps(const char *label, const ts_record_t *recs, int n) {
             overlaps++;
         }
 
-        if (prev->shader_end > curr->shader_start &&
-            prev->shader_start != 0 && curr->shader_start != 0) {
-            printf("  !! SHADER OVERLAP %s [%d->%d]: prev_end=%lu > "
-                   "curr_start=%lu\n",
-                   label, i - 1, i, prev->shader_end, curr->shader_start);
+        if (prev->shader_realtime_2 > curr->shader_realtime_1 &&
+            prev->shader_realtime_1 != 0 && curr->shader_realtime_1 != 0) {
+            printf("  !! SHADER REALTIME OVERLAP %s [%d->%d]: prev_rt2=%lu > "
+                   "curr_rt1=%lu\n",
+                   label, i - 1, i, prev->shader_realtime_2, curr->shader_realtime_1);
             overlaps++;
         }
     }
@@ -656,9 +677,14 @@ static int check_ordering(const ts_record_t *recs, int n) {
                    r, rc->cp_start, rc->cp_end);
             ok = 0;
         }
-        if (rc->shader_start != 0 && rc->shader_start >= rc->shader_end) {
-            printf("  [%d] shader_start (%lu) >= shader_end (%lu)\n",
-                   r, rc->shader_start, rc->shader_end);
+        if (rc->shader_realtime_1 != 0 && rc->shader_realtime_1 >= rc->shader_realtime_2) {
+            printf("  [%d] shader_realtime_1 (%lu) >= shader_realtime_2 (%lu)\n",
+                   r, rc->shader_realtime_1, rc->shader_realtime_2);
+            ok = 0;
+        }
+        if (rc->shader_cycles_1 != 0 && rc->shader_cycles_1 >= rc->shader_cycles_2) {
+            printf("  [%d] shader_cycles_1 (%lu) >= shader_cycles_2 (%lu)\n",
+                   r, rc->shader_cycles_1, rc->shader_cycles_2);
             ok = 0;
         }
         if (!ok) fails++;
@@ -767,9 +793,9 @@ int main(int argc, char **argv) {
     run_sequential(queue, &ki, A, B, C, N, num_groups, num_runs, seq_recs);
     print_records(seq_recs, num_runs);
 
-    /* Print per-workgroup timestamps for first run */
+    /* Print dual-clock detail for first run */
     if (num_runs > 0) {
-        print_per_workgroup_timestamps(&seq_recs[0], 0);
+        print_dual_clock_detail(&seq_recs[1], 1);
     }
 
     printf("\n  ── Sequential overlap analysis ──\n");
@@ -796,9 +822,9 @@ int main(int argc, char **argv) {
     run_burst(queue, &ki, A, B, C, N, num_groups, num_runs, burst_recs);
     print_records(burst_recs, num_runs);
 
-    /* Print per-workgroup timestamps for first run */
+    /* Print dual-clock detail for first run */
     if (num_runs > 0) {
-        print_per_workgroup_timestamps(&burst_recs[0], 0);
+        print_dual_clock_detail(&burst_recs[1], 1);
     }
 
     printf("\n  ── Burst overlap analysis ──\n");
@@ -818,18 +844,42 @@ int main(int argc, char **argv) {
         printf("  FAIL: %d/%d burst ordering violations.\n",
                burst_ord, num_runs);
 
-    /* ── 8. Shader clock estimation ── */
-    if (num_runs > 0 && seq_recs[0].shader_start != 0) {
-        printf("\n━━━ Shader clock estimation ━━━\n");
-        ts_record_t *rc = &seq_recs[0];
-        double cp_dur_ns = (double)(rc->cp_end - rc->cp_start) * 1e9 /
-                           (double)g_sys_freq;
-        uint64_t shader_dur = rc->shader_end - rc->shader_start;
-        if (shader_dur > 0) {
-            double shader_freq_mhz = (double)shader_dur / cp_dur_ns * 1e3;
-            printf("  Estimated shader clock: %.1f MHz  "
-                   "(run 0: %lu shader ticks / %.1f ns CP)\n",
-                   shader_freq_mhz, shader_dur, cp_dur_ns);
+    /* ── 8. Dual-clock analysis ── */
+    if (num_runs > 0 && seq_recs[0].shader_realtime_1 != 0) {
+        printf("\n━━━ Dual-clock frequency analysis ━━━\n");
+
+        /* Compute average deltas across all sequential runs */
+        uint64_t sum_rt_delta = 0, sum_cyc_delta = 0;
+        int valid_runs = 0;
+
+        for (int i = 0; i < num_runs; i++) {
+            uint64_t rt_d = seq_recs[i].shader_realtime_2 - seq_recs[i].shader_realtime_1;
+            uint64_t cyc_d = seq_recs[i].shader_cycles_2 - seq_recs[i].shader_cycles_1;
+            if (rt_d > 0 && cyc_d > 0) {
+                sum_rt_delta += rt_d;
+                sum_cyc_delta += cyc_d;
+                valid_runs++;
+            }
+        }
+
+        if (valid_runs > 0) {
+            double avg_rt = (double)sum_rt_delta / (double)valid_runs;
+            double avg_cyc = (double)sum_cyc_delta / (double)valid_runs;
+            double ratio = avg_cyc / avg_rt;
+
+            printf("  Average barrier overhead (across %d runs):\n", valid_runs);
+            printf("    s_memrealtime delta = %.1f ticks\n", avg_rt);
+            printf("    s_memtime delta     = %.1f cycles\n", avg_cyc);
+            printf("    cycles/realtime ratio = %.6f\n", ratio);
+
+            /* Estimate frequencies assuming s_memrealtime uses system clock */
+            double rt_ns = avg_rt * 1e9 / (double)g_sys_freq;
+            if (rt_ns > 0) {
+                double shader_freq_mhz = avg_cyc / rt_ns * 1e3;
+                printf("    Estimated shader clock: %.1f MHz\n", shader_freq_mhz);
+                printf("    (assuming s_memrealtime runs at %.1f MHz)\n",
+                       (double)g_sys_freq / 1e6);
+            }
         }
     }
 
