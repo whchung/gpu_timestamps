@@ -809,9 +809,9 @@ int main(int argc, char **argv) {
     run_sequential(queue, &ki, A, B, C, N, num_groups, num_runs, seq_recs);
     print_records(seq_recs, num_runs);
 
-    /* Print dual-clock detail for first run */
-    if (num_runs > 0) {
-        print_dual_clock_detail(&seq_recs[1], 1);
+    /* Print dual-clock detail for all runs */
+    for (int r = 0; r < num_runs; r++) {
+        print_dual_clock_detail(&seq_recs[r], r);
     }
 
     printf("\n  ── Sequential overlap analysis ──\n");
@@ -838,9 +838,9 @@ int main(int argc, char **argv) {
     run_burst(queue, &ki, A, B, C, N, num_groups, num_runs, burst_recs);
     print_records(burst_recs, num_runs);
 
-    /* Print dual-clock detail for first run */
-    if (num_runs > 0) {
-        print_dual_clock_detail(&burst_recs[1], 1);
+    /* Print dual-clock detail for all runs */
+    for (int r = 0; r < num_runs; r++) {
+        print_dual_clock_detail(&burst_recs[r], r);
     }
 
     printf("\n  ── Burst overlap analysis ──\n");
