@@ -247,6 +247,32 @@ static inline void packet_store_release(uint32_t *pkt,
     __atomic_store_n(pkt, header | ((uint32_t)setup << 16), __ATOMIC_RELEASE);
 }
 
+/* ── Submit barrier packet with system-scope release fence ─────── */
+
+static void submit_barrier_packet(hsa_queue_t *queue, hsa_signal_t signal) {
+    uint64_t index = hsa_queue_add_write_index_screlease(queue, 1);
+
+    const uint32_t sw_queue_size = queue->size - 1;
+    while ((index - hsa_queue_load_read_index_scacquire(queue)) >= sw_queue_size) {
+        sched_yield();
+    }
+
+    uint32_t slot = (uint32_t)(index & (queue->size - 1));
+    hsa_barrier_and_packet_t *pkt =
+        &((hsa_barrier_and_packet_t *)(queue->base_address))[slot];
+
+    memset(pkt, 0, sizeof(*pkt));
+    pkt->completion_signal = signal;
+
+    uint16_t header =
+        (HSA_PACKET_TYPE_BARRIER_AND << HSA_PACKET_HEADER_TYPE)
+      | (HSA_FENCE_SCOPE_NONE << HSA_PACKET_HEADER_ACQUIRE_FENCE_SCOPE)
+      | (HSA_FENCE_SCOPE_SYSTEM << HSA_PACKET_HEADER_RELEASE_FENCE_SCOPE);
+
+    packet_store_release((uint32_t *)pkt, header, 0);
+    hsa_signal_store_screlease(queue->doorbell_signal, (hsa_signal_value_t)index);
+}
+
 /* ── Init HSA runtime ───────────────────────────────────────────── */
 
 static void init_hsa(void) {
@@ -459,6 +485,16 @@ static void run_sequential(hsa_queue_t *queue, const kernel_info_t *ki,
         /* Dispatch */
         dispatch_one(queue, ki, kernarg, signal, num_groups);
 
+        /* Submit barrier packet with release fence if --no-fence mode */
+        if (g_fence_scope == HSA_FENCE_SCOPE_NONE) {
+            hsa_signal_t barrier_signal;
+            HSA_CHECK("barrier_signal", hsa_signal_create(1, 0, NULL, &barrier_signal));
+            submit_barrier_packet(queue, barrier_signal);
+            hsa_signal_wait_scacquire(barrier_signal, HSA_SIGNAL_CONDITION_EQ, 0,
+                                      UINT64_MAX, HSA_WAIT_STATE_BLOCKED);
+            hsa_signal_destroy(barrier_signal);
+        }
+
         /* Wait */
         hsa_signal_wait_scacquire(signal, HSA_SIGNAL_CONDITION_EQ, 0,
                                   UINT64_MAX, HSA_WAIT_STATE_BLOCKED);
@@ -528,9 +564,23 @@ static void run_burst(hsa_queue_t *queue, const kernel_info_t *ki,
         dispatch_one(queue, ki, kernargs[r], signals[r], num_groups);
     }
 
+    /* Submit barrier packet with release fence if --no-fence mode */
+    hsa_signal_t barrier_signal = {0};
+    if (g_fence_scope == HSA_FENCE_SCOPE_NONE) {
+        HSA_CHECK("barrier_signal", hsa_signal_create(1, 0, NULL, &barrier_signal));
+        submit_barrier_packet(queue, barrier_signal);
+    }
+
     /* Wait for last signal (all on same queue → serial execution) */
     hsa_signal_wait_scacquire(signals[num_runs - 1], HSA_SIGNAL_CONDITION_EQ, 0,
                               UINT64_MAX, HSA_WAIT_STATE_BLOCKED);
+
+    /* Wait for barrier to ensure GPU writes are visible */
+    if (g_fence_scope == HSA_FENCE_SCOPE_NONE) {
+        hsa_signal_wait_scacquire(barrier_signal, HSA_SIGNAL_CONDITION_EQ, 0,
+                                  UINT64_MAX, HSA_WAIT_STATE_BLOCKED);
+        hsa_signal_destroy(barrier_signal);
+    }
 
     uint64_t burst_post = hsa_timestamp_now();
     printf("  Total burst wall time: %.1f us\n",
