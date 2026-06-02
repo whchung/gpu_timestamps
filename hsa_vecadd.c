@@ -13,7 +13,7 @@
  *
  * Collects timestamps from:
  *   1. HSA system clock (host-side, before/after dispatch)
- *   2. CP completion signal (hsa_amd_profiling_get_dispatch_time)
+ *   2. CP timestamps (read directly from amd_signal_t structure)
  *   3. Shader dual clocks (s_memrealtime + s_memtime, before/after barrier)
  *
  * Two dispatch patterns:
@@ -38,6 +38,27 @@
 
 #include <hsa/hsa.h>
 #include <hsa/hsa_ext_amd.h>
+
+/* ── AMD signal structure (for direct timestamp access) ─────────── */
+
+typedef struct {
+    int32_t  kind;
+    union {
+        volatile int32_t value;
+        volatile uint32_t raw32[2];
+        volatile uint64_t raw64;
+    };
+    uint64_t event_mailbox_ptr;
+    uint32_t event_id;
+    uint32_t reserved1;
+    uint64_t start_ts;
+    uint64_t end_ts;
+    union {
+        void *queue_ptr;
+        uint64_t raw64_1;
+    };
+    uint32_t reserved2[2];
+} amd_signal_t;
 
 /* ── Configuration ──────────────────────────────────────────────── */
 
@@ -70,9 +91,6 @@ typedef struct {
 
     uint64_t cp_start;
     uint64_t cp_end;
-
-    uint64_t cp_start_sys;
-    uint64_t cp_end_sys;
 
     /* Shader dual-clock measurements (single wave) */
     uint64_t shader_realtime_1;
@@ -440,20 +458,10 @@ static void run_sequential(hsa_queue_t *queue, const kernel_info_t *ki,
         /* Timestamp point 1 cont: host post */
         records[r].host_post = hsa_timestamp_now();
 
-        /* Timestamp point 2: CP dispatch time */
-        hsa_amd_profiling_dispatch_time_t cp_time;
-        HSA_CHECK("cp_time",
-                  hsa_amd_profiling_get_dispatch_time(g_gpu, signal, &cp_time));
-        records[r].cp_start = cp_time.start;
-        records[r].cp_end   = cp_time.end;
-
-        /* Convert CP timestamps to system domain */
-        HSA_CHECK("cp_start_sys",
-                  hsa_amd_profiling_convert_tick_to_system_domain(
-                      g_gpu, cp_time.start, &records[r].cp_start_sys));
-        HSA_CHECK("cp_end_sys",
-                  hsa_amd_profiling_convert_tick_to_system_domain(
-                      g_gpu, cp_time.end, &records[r].cp_end_sys));
+        /* Timestamp point 2: CP timestamps from signal structure */
+        amd_signal_t *amd_sig = (amd_signal_t *)signal.handle;
+        records[r].cp_start = amd_sig->start_ts;
+        records[r].cp_end   = amd_sig->end_ts;
 
         /* Timestamp point 3: shader dual-clock measurements */
         records[r].shader_realtime_1 = ts_shader[0];
@@ -516,36 +524,21 @@ static void run_burst(hsa_queue_t *queue, const kernel_info_t *ki,
     printf("  Total burst wall time: %.1f us\n",
            (double)(burst_post - burst_pre) * 1e6 / (double)g_sys_freq);
 
-    /* Pass 1: Read ALL raw CP timestamps first.
-     * NOTE: hsa_amd_profiling_convert_tick_to_system_domain must NOT be
-     * interleaved with get_dispatch_time — it perturbs the runtime's
-     * internal clock-conversion state, causing the returned raw ticks
-     * to jitter by ±10-450 ns, which manifests as spurious overlap. */
+    /* Read timestamps from signal structures */
     for (int r = 0; r < num_runs; r++) {
         records[r].host_pre  = burst_pre;
         records[r].host_post = burst_post;
 
-        hsa_amd_profiling_dispatch_time_t cp;
-        HSA_CHECK("cp_burst",
-                  hsa_amd_profiling_get_dispatch_time(g_gpu, signals[r], &cp));
-        records[r].cp_start = cp.start;
-        records[r].cp_end   = cp.end;
+        /* CP timestamps from signal structure */
+        amd_signal_t *amd_sig = (amd_signal_t *)signals[r].handle;
+        records[r].cp_start = amd_sig->start_ts;
+        records[r].cp_end   = amd_sig->end_ts;
 
         /* Shader dual-clock measurements */
         records[r].shader_realtime_1 = ts_bufs[r][0];
         records[r].shader_cycles_1   = ts_bufs[r][1];
         records[r].shader_realtime_2 = ts_bufs[r][2];
         records[r].shader_cycles_2   = ts_bufs[r][3];
-    }
-
-    /* Pass 2: Convert ticks to system domain AFTER all raw reads. */
-    for (int r = 0; r < num_runs; r++) {
-        HSA_CHECK("cp_sys_burst_s",
-                  hsa_amd_profiling_convert_tick_to_system_domain(
-                      g_gpu, records[r].cp_start, &records[r].cp_start_sys));
-        HSA_CHECK("cp_sys_burst_e",
-                  hsa_amd_profiling_convert_tick_to_system_domain(
-                      g_gpu, records[r].cp_end, &records[r].cp_end_sys));
     }
 
     /* Cleanup */
@@ -883,21 +876,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* ── 10. convert_tick_to_system_domain diagnostic ── */
-    if (num_runs > 0) {
-        printf("\n━━━ convert_tick_to_system_domain diagnostic ━━━\n");
-        ts_record_t *rc = &seq_recs[0];
-        printf("  Run 0:  cp_start (raw) = %lu\n", rc->cp_start);
-        printf("          cp_start (sys) = %lu\n", rc->cp_start_sys);
-        if (rc->cp_start > 0) {
-            printf("          ratio sys/raw  = %.6f\n",
-                   (double)rc->cp_start_sys / (double)rc->cp_start);
-        }
-        printf("  If ratio != 1.0, the convert function uses a different "
-               "time base.\n");
-    }
-
-    /* ── 11. Final summary ── */
+    /* ── 9. Final summary ── */
     printf("\n╔══════════════════════════════════════════════════════════╗\n");
     if (total_overlaps == 0) {
         printf("║  RESULT: PASS — no timestamp overlaps detected         ║\n");
