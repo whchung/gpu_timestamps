@@ -621,20 +621,21 @@ static void print_dual_clock_detail(const ts_record_t *rec, int run_num) {
     printf("    delta = %lu ticks\n\n", rec->cp_end - rec->cp_start);
 
     printf("  Per-Chiplet Shader Timestamps:\n");
-    printf("  %7s  %20s  %20s  %20s  %20s  %15s  %15s  %12s\n",
-           "Chiplet", "RT_1", "CYC_1", "RT_2", "CYC_2", "RT_Δ", "CYC_Δ", "CYC/RT");
+    printf("  %7s  %15s  %20s  %20s  %20s  %20s  %15s  %15s  %12s\n",
+           "Chiplet", "CP→RT_1", "RT_1", "CYC_1", "RT_2", "CYC_2", "RT_Δ", "CYC_Δ", "CYC/RT");
 
     for (int c = 0; c < NUM_WORKGROUPS; c++) {
         uint64_t rt1 = rec->chiplet_realtime_1[c];
         uint64_t cyc1 = rec->chiplet_cycles_1[c];
         uint64_t rt2 = rec->chiplet_realtime_2[c];
         uint64_t cyc2 = rec->chiplet_cycles_2[c];
+        uint64_t cp_to_rt1 = (rt1 > rec->cp_start) ? (rt1 - rec->cp_start) : 0;
         uint64_t rt_delta = rt2 - rt1;
         uint64_t cyc_delta = cyc2 - cyc1;
         double ratio = (rt_delta > 0) ? (double)cyc_delta / (double)rt_delta : 0.0;
 
-        printf("  %7d  %20lu  %20lu  %20lu  %20lu  %15lu  %15lu  %12.6f\n",
-               c, rt1, cyc1, rt2, cyc2, rt_delta, cyc_delta, ratio);
+        printf("  %7d  %15lu  %20lu  %20lu  %20lu  %20lu  %15lu  %15lu  %12.6f\n",
+               c, cp_to_rt1, rt1, cyc1, rt2, cyc2, rt_delta, cyc_delta, ratio);
     }
 }
 
