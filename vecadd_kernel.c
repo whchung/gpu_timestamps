@@ -1,5 +1,5 @@
 /*
- * vecadd_kernel.c — Pure AMDGPU kernel: dual-clock timestamp measurement.
+ * vecadd_kernel.c — Pure AMDGPU kernel: per-chiplet dual-clock timestamp measurement.
  *
  * Zero HIP dependency.  Uses only hardware intrinsics:
  *   __builtin_amdgcn_workgroup_id_x()   — SGPR
@@ -9,7 +9,8 @@
  *   __builtin_amdgcn_s_memtime()        — Shader cycles counter (gfx9xx)
  *   __builtin_readcyclecounter()        — Shader cycles counter (gfx1250)
  *
- * Single-wave measurement protocol:
+ * Per-chiplet measurement protocol (8 workgroups, 1 per chiplet):
+ *   Each workgroup (lane 0 only):
  *   1. Capture REALTIME #1 + SHADER_CYCLES #1 (store locally)
  *   2. Store those out, s_wait_kmcnt, barrier (no other work)
  *   3. Capture REALTIME #2 + SHADER_CYCLES #2
@@ -38,8 +39,8 @@ void vecadd_timestamp(
     uint32_t wg_id = __builtin_amdgcn_workgroup_id_x();
     uint32_t wi_id = __builtin_amdgcn_workitem_id_x();
 
-    /* Single wave (workgroup 0, lane 0) captures dual timestamps */
-    if (wg_id == 0 && wi_id == 0) {
+    /* Each workgroup (lane 0 only) captures dual timestamps for its chiplet */
+    if (wi_id == 0) {
         /* Measurement #1: REALTIME and SHADER_CYCLES (store locally) */
 #if defined(__gfx950__) || defined(__gfx942__) || defined(__gfx908__) || defined(__gfx900__)
         uint64_t realtime_1 = __builtin_amdgcn_s_memrealtime();
@@ -49,9 +50,10 @@ void vecadd_timestamp(
         uint64_t cycles_1   = __builtin_readcyclecounter();
 #endif
 
-        /* Store first pair */
-        ts_shader[0] = realtime_1;
-        ts_shader[1] = cycles_1;
+        /* Store first pair (each workgroup uses offset wg_id * 4) */
+        uint32_t base_offset = wg_id * 4;
+        ts_shader[base_offset + 0] = realtime_1;
+        ts_shader[base_offset + 1] = cycles_1;
 
         /* Wait for stores to complete */
 #if defined(__gfx950__) || defined(__gfx942__) || defined(__gfx908__) || defined(__gfx900__)
@@ -73,8 +75,8 @@ void vecadd_timestamp(
 #endif
 
         /* Store second pair */
-        ts_shader[2] = realtime_2;
-        ts_shader[3] = cycles_2;
+        ts_shader[base_offset + 2] = realtime_2;
+        ts_shader[base_offset + 3] = cycles_2;
     }
 
     /* Optional: still do the vector add for functional testing */

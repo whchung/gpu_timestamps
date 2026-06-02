@@ -92,11 +92,11 @@ typedef struct {
     uint64_t cp_start;
     uint64_t cp_end;
 
-    /* Shader dual-clock measurements (single wave) */
-    uint64_t shader_realtime_1;
-    uint64_t shader_cycles_1;
-    uint64_t shader_realtime_2;
-    uint64_t shader_cycles_2;
+    /* Shader dual-clock measurements (per-chiplet, 8 chiplets) */
+    uint64_t chiplet_realtime_1[NUM_WORKGROUPS];
+    uint64_t chiplet_cycles_1[NUM_WORKGROUPS];
+    uint64_t chiplet_realtime_2[NUM_WORKGROUPS];
+    uint64_t chiplet_cycles_2[NUM_WORKGROUPS];
 } ts_record_t;
 
 /* ── SDMA timestamp record ──────────────────────────────────────── */
@@ -124,11 +124,15 @@ typedef struct {
  *   offset 32: uint32_t N            (4 bytes)
  *   total: 36 bytes (no HIP implicit arguments)
  *
- * ts_shader buffer layout (4 uint64_t values):
- *   [0] = realtime_1
- *   [1] = cycles_1
- *   [2] = realtime_2
- *   [3] = cycles_2
+ * ts_shader buffer layout (32 uint64_t values, 8 workgroups × 4 values):
+ *   Workgroup 0 (chiplet 0): [0..3]   = realtime_1, cycles_1, realtime_2, cycles_2
+ *   Workgroup 1 (chiplet 1): [4..7]   = realtime_1, cycles_1, realtime_2, cycles_2
+ *   Workgroup 2 (chiplet 2): [8..11]  = realtime_1, cycles_1, realtime_2, cycles_2
+ *   Workgroup 3 (chiplet 3): [12..15] = realtime_1, cycles_1, realtime_2, cycles_2
+ *   Workgroup 4 (chiplet 4): [16..19] = realtime_1, cycles_1, realtime_2, cycles_2
+ *   Workgroup 5 (chiplet 5): [20..23] = realtime_1, cycles_1, realtime_2, cycles_2
+ *   Workgroup 6 (chiplet 6): [24..27] = realtime_1, cycles_1, realtime_2, cycles_2
+ *   Workgroup 7 (chiplet 7): [28..31] = realtime_1, cycles_1, realtime_2, cycles_2
  */
 
 /* ── Global state ───────────────────────────────────────────────── */
@@ -419,7 +423,7 @@ static void run_sequential(hsa_queue_t *queue, const kernel_info_t *ki,
                             float *A, float *B, float *C,
                             uint32_t N, uint32_t num_groups,
                             int num_runs, ts_record_t *records) {
-    size_t ts_bytes = 4 * sizeof(uint64_t);  /* 4 values: realtime1, cycles1, realtime2, cycles2 */
+    size_t ts_bytes = num_groups * 4 * sizeof(uint64_t);  /* 8 workgroups × 4 values each */
 
     for (int r = 0; r < num_runs; r++) {
         /* Per-dispatch shader timestamp buffer */
@@ -463,11 +467,14 @@ static void run_sequential(hsa_queue_t *queue, const kernel_info_t *ki,
         records[r].cp_start = amd_sig->start_ts;
         records[r].cp_end   = amd_sig->end_ts;
 
-        /* Timestamp point 3: shader dual-clock measurements */
-        records[r].shader_realtime_1 = ts_shader[0];
-        records[r].shader_cycles_1   = ts_shader[1];
-        records[r].shader_realtime_2 = ts_shader[2];
-        records[r].shader_cycles_2   = ts_shader[3];
+        /* Timestamp point 3: shader dual-clock measurements (per-chiplet) */
+        for (uint32_t wg = 0; wg < num_groups; wg++) {
+            uint32_t base_offset = wg * 4;
+            records[r].chiplet_realtime_1[wg] = ts_shader[base_offset + 0];
+            records[r].chiplet_cycles_1[wg]   = ts_shader[base_offset + 1];
+            records[r].chiplet_realtime_2[wg] = ts_shader[base_offset + 2];
+            records[r].chiplet_cycles_2[wg]   = ts_shader[base_offset + 3];
+        }
 
         hsa_signal_destroy(signal);
         hsa_amd_memory_pool_free(kernarg);
@@ -481,7 +488,7 @@ static void run_burst(hsa_queue_t *queue, const kernel_info_t *ki,
                        float *A, float *B, float *C,
                        uint32_t N, uint32_t num_groups,
                        int num_runs, ts_record_t *records) {
-    size_t ts_bytes = 4 * sizeof(uint64_t);  /* 4 values: realtime1, cycles1, realtime2, cycles2 */
+    size_t ts_bytes = num_groups * 4 * sizeof(uint64_t);  /* 8 workgroups × 4 values each */
 
     hsa_signal_t *signals  = calloc(num_runs, sizeof(hsa_signal_t));
     void        **kernargs = calloc(num_runs, sizeof(void *));
@@ -534,11 +541,14 @@ static void run_burst(hsa_queue_t *queue, const kernel_info_t *ki,
         records[r].cp_start = amd_sig->start_ts;
         records[r].cp_end   = amd_sig->end_ts;
 
-        /* Shader dual-clock measurements */
-        records[r].shader_realtime_1 = ts_bufs[r][0];
-        records[r].shader_cycles_1   = ts_bufs[r][1];
-        records[r].shader_realtime_2 = ts_bufs[r][2];
-        records[r].shader_cycles_2   = ts_bufs[r][3];
+        /* Shader dual-clock measurements (per-chiplet) */
+        for (uint32_t wg = 0; wg < num_groups; wg++) {
+            uint32_t base_offset = wg * 4;
+            records[r].chiplet_realtime_1[wg] = ts_bufs[r][base_offset + 0];
+            records[r].chiplet_cycles_1[wg]   = ts_bufs[r][base_offset + 1];
+            records[r].chiplet_realtime_2[wg] = ts_bufs[r][base_offset + 2];
+            records[r].chiplet_cycles_2[wg]   = ts_bufs[r][base_offset + 3];
+        }
     }
 
     /* Cleanup */
@@ -580,50 +590,51 @@ static void sdma_copy_profiled(void *dst, hsa_agent_t dst_agent,
 static void print_records(const ts_record_t *recs, int n) {
     double to_us = 1e6 / (double)g_sys_freq;
 
-    printf("  %4s  %20s  %20s  %10s  %15s  %15s  %15s  %15s\n",
-           "Run", "CP_start", "CP_end", "CP(us)",
-           "RT_delta", "CYC_delta", "RT1", "CYC1");
+    printf("  %4s  %20s  %20s  %10s  ", "Run", "CP_start", "CP_end", "CP(us)");
+    for (int c = 0; c < NUM_WORKGROUPS; c++) {
+        printf("  C%d_RT_Δ  C%d_CYC_Δ", c, c);
+    }
+    printf("\n");
 
     for (int i = 0; i < n; i++) {
         const ts_record_t *r = &recs[i];
         double cp_dur = (double)(r->cp_end - r->cp_start) * to_us;
-        uint64_t rt_delta = r->shader_realtime_2 - r->shader_realtime_1;
-        uint64_t cyc_delta = r->shader_cycles_2 - r->shader_cycles_1;
 
-        printf("  %4d  %20lu  %20lu  %10.1f  %15lu  %15lu  %15lu  %15lu\n",
-               i, r->cp_start, r->cp_end, cp_dur,
-               rt_delta, cyc_delta,
-               r->shader_realtime_1, r->shader_cycles_1);
+        printf("  %4d  %20lu  %20lu  %10.1f  ", i, r->cp_start, r->cp_end, cp_dur);
+
+        for (int c = 0; c < NUM_WORKGROUPS; c++) {
+            uint64_t rt_delta = r->chiplet_realtime_2[c] - r->chiplet_realtime_1[c];
+            uint64_t cyc_delta = r->chiplet_cycles_2[c] - r->chiplet_cycles_1[c];
+            printf("%9lu %10lu", rt_delta, cyc_delta);
+        }
+        printf("\n");
     }
 }
 
 /* ── Print detailed dual-clock measurements ─────────────────────── */
 
 static void print_dual_clock_detail(const ts_record_t *rec, int run_num) {
-    printf("\n━━━ Run %d: Dual-Clock Measurement Detail ━━━\n", run_num);
+    printf("\n━━━ Run %d: Per-Chiplet Dual-Clock Measurement Detail ━━━\n", run_num);
     printf("  CP timestamps:\n");
     printf("    start = %lu\n", rec->cp_start);
     printf("    end   = %lu\n", rec->cp_end);
     printf("    delta = %lu ticks\n\n", rec->cp_end - rec->cp_start);
 
-    printf("  Shader timestamps (single wave):\n");
-    printf("    Measurement #1 (before barrier):\n");
-    printf("      s_memrealtime = %lu\n", rec->shader_realtime_1);
-    printf("      s_memtime     = %lu\n", rec->shader_cycles_1);
-    printf("    Measurement #2 (after barrier):\n");
-    printf("      s_memrealtime = %lu\n", rec->shader_realtime_2);
-    printf("      s_memtime     = %lu\n\n", rec->shader_cycles_2);
+    printf("  Per-Chiplet Shader Timestamps:\n");
+    printf("  %7s  %20s  %20s  %20s  %20s  %15s  %15s  %12s\n",
+           "Chiplet", "RT_1", "CYC_1", "RT_2", "CYC_2", "RT_Δ", "CYC_Δ", "CYC/RT");
 
-    uint64_t rt_delta = rec->shader_realtime_2 - rec->shader_realtime_1;
-    uint64_t cyc_delta = rec->shader_cycles_2 - rec->shader_cycles_1;
+    for (int c = 0; c < NUM_WORKGROUPS; c++) {
+        uint64_t rt1 = rec->chiplet_realtime_1[c];
+        uint64_t cyc1 = rec->chiplet_cycles_1[c];
+        uint64_t rt2 = rec->chiplet_realtime_2[c];
+        uint64_t cyc2 = rec->chiplet_cycles_2[c];
+        uint64_t rt_delta = rt2 - rt1;
+        uint64_t cyc_delta = cyc2 - cyc1;
+        double ratio = (rt_delta > 0) ? (double)cyc_delta / (double)rt_delta : 0.0;
 
-    printf("  Delta (measurement #2 - #1):\n");
-    printf("    s_memrealtime delta = %lu ticks\n", rt_delta);
-    printf("    s_memtime delta     = %lu cycles\n", cyc_delta);
-
-    if (cyc_delta > 0 && rt_delta > 0) {
-        double ratio = (double)cyc_delta / (double)rt_delta;
-        printf("    cycles/realtime ratio = %.6f\n", ratio);
+        printf("  %7d  %20lu  %20lu  %20lu  %20lu  %15lu  %15lu  %12.6f\n",
+               c, rt1, cyc1, rt2, cyc2, rt_delta, cyc_delta, ratio);
     }
 }
 
@@ -646,12 +657,16 @@ static int check_overlaps(const char *label, const ts_record_t *recs, int n) {
             overlaps++;
         }
 
-        if (prev->shader_realtime_2 > curr->shader_realtime_1 &&
-            prev->shader_realtime_1 != 0 && curr->shader_realtime_1 != 0) {
-            printf("  !! SHADER REALTIME OVERLAP %s [%d->%d]: prev_rt2=%lu > "
-                   "curr_rt1=%lu\n",
-                   label, i - 1, i, prev->shader_realtime_2, curr->shader_realtime_1);
-            overlaps++;
+        /* Check for shader timestamp overlaps across chiplets */
+        for (int c = 0; c < NUM_WORKGROUPS; c++) {
+            if (prev->chiplet_realtime_2[c] > curr->chiplet_realtime_1[c] &&
+                prev->chiplet_realtime_1[c] != 0 && curr->chiplet_realtime_1[c] != 0) {
+                printf("  !! SHADER REALTIME OVERLAP %s [%d->%d] Chiplet %d: prev_rt2=%lu > "
+                       "curr_rt1=%lu\n",
+                       label, i - 1, i, c, prev->chiplet_realtime_2[c],
+                       curr->chiplet_realtime_1[c]);
+                overlaps++;
+            }
         }
     }
     return overlaps;
@@ -670,16 +685,23 @@ static int check_ordering(const ts_record_t *recs, int n) {
                    r, rc->cp_start, rc->cp_end);
             ok = 0;
         }
-        if (rc->shader_realtime_1 != 0 && rc->shader_realtime_1 >= rc->shader_realtime_2) {
-            printf("  [%d] shader_realtime_1 (%lu) >= shader_realtime_2 (%lu)\n",
-                   r, rc->shader_realtime_1, rc->shader_realtime_2);
-            ok = 0;
+
+        /* Check ordering for each chiplet */
+        for (int c = 0; c < NUM_WORKGROUPS; c++) {
+            if (rc->chiplet_realtime_1[c] != 0 &&
+                rc->chiplet_realtime_1[c] >= rc->chiplet_realtime_2[c]) {
+                printf("  [%d] Chiplet %d: realtime_1 (%lu) >= realtime_2 (%lu)\n",
+                       r, c, rc->chiplet_realtime_1[c], rc->chiplet_realtime_2[c]);
+                ok = 0;
+            }
+            if (rc->chiplet_cycles_1[c] != 0 &&
+                rc->chiplet_cycles_1[c] >= rc->chiplet_cycles_2[c]) {
+                printf("  [%d] Chiplet %d: cycles_1 (%lu) >= cycles_2 (%lu)\n",
+                       r, c, rc->chiplet_cycles_1[c], rc->chiplet_cycles_2[c]);
+                ok = 0;
+            }
         }
-        if (rc->shader_cycles_1 != 0 && rc->shader_cycles_1 >= rc->shader_cycles_2) {
-            printf("  [%d] shader_cycles_1 (%lu) >= shader_cycles_2 (%lu)\n",
-                   r, rc->shader_cycles_1, rc->shader_cycles_2);
-            ok = 0;
-        }
+
         if (!ok) fails++;
     }
     return fails;
@@ -837,43 +859,47 @@ int main(int argc, char **argv) {
         printf("  FAIL: %d/%d burst ordering violations.\n",
                burst_ord, num_runs);
 
-    /* ── 8. Dual-clock analysis ── */
-    if (num_runs > 0 && seq_recs[0].shader_realtime_1 != 0) {
-        printf("\n━━━ Dual-clock frequency analysis ━━━\n");
+    /* ── 8. Per-Chiplet Dual-clock analysis ── */
+    if (num_runs > 0 && seq_recs[0].chiplet_realtime_1[0] != 0) {
+        printf("\n━━━ Per-Chiplet Dual-clock frequency analysis ━━━\n");
 
-        /* Compute average deltas across all sequential runs */
-        uint64_t sum_rt_delta = 0, sum_cyc_delta = 0;
-        int valid_runs = 0;
+        /* Compute average deltas for each chiplet across all sequential runs */
+        for (int c = 0; c < NUM_WORKGROUPS; c++) {
+            uint64_t sum_rt_delta = 0, sum_cyc_delta = 0;
+            int valid_runs = 0;
 
-        for (int i = 0; i < num_runs; i++) {
-            uint64_t rt_d = seq_recs[i].shader_realtime_2 - seq_recs[i].shader_realtime_1;
-            uint64_t cyc_d = seq_recs[i].shader_cycles_2 - seq_recs[i].shader_cycles_1;
-            if (rt_d > 0 && cyc_d > 0) {
-                sum_rt_delta += rt_d;
-                sum_cyc_delta += cyc_d;
-                valid_runs++;
+            for (int i = 0; i < num_runs; i++) {
+                uint64_t rt_d = seq_recs[i].chiplet_realtime_2[c] -
+                                seq_recs[i].chiplet_realtime_1[c];
+                uint64_t cyc_d = seq_recs[i].chiplet_cycles_2[c] -
+                                 seq_recs[i].chiplet_cycles_1[c];
+                if (rt_d > 0 && cyc_d > 0) {
+                    sum_rt_delta += rt_d;
+                    sum_cyc_delta += cyc_d;
+                    valid_runs++;
+                }
+            }
+
+            if (valid_runs > 0) {
+                double avg_rt = (double)sum_rt_delta / (double)valid_runs;
+                double avg_cyc = (double)sum_cyc_delta / (double)valid_runs;
+                double ratio = avg_cyc / avg_rt;
+
+                printf("\n  Chiplet %d (across %d runs):\n", c, valid_runs);
+                printf("    s_memrealtime delta = %.1f ticks\n", avg_rt);
+                printf("    s_memtime delta     = %.1f cycles\n", avg_cyc);
+                printf("    cycles/realtime ratio = %.6f\n", ratio);
+
+                /* Estimate frequencies assuming s_memrealtime uses system clock */
+                double rt_ns = avg_rt * 1e9 / (double)g_sys_freq;
+                if (rt_ns > 0) {
+                    double shader_freq_mhz = avg_cyc / rt_ns * 1e3;
+                    printf("    Estimated shader clock: %.1f MHz\n", shader_freq_mhz);
+                }
             }
         }
-
-        if (valid_runs > 0) {
-            double avg_rt = (double)sum_rt_delta / (double)valid_runs;
-            double avg_cyc = (double)sum_cyc_delta / (double)valid_runs;
-            double ratio = avg_cyc / avg_rt;
-
-            printf("  Average barrier overhead (across %d runs):\n", valid_runs);
-            printf("    s_memrealtime delta = %.1f ticks\n", avg_rt);
-            printf("    s_memtime delta     = %.1f cycles\n", avg_cyc);
-            printf("    cycles/realtime ratio = %.6f\n", ratio);
-
-            /* Estimate frequencies assuming s_memrealtime uses system clock */
-            double rt_ns = avg_rt * 1e9 / (double)g_sys_freq;
-            if (rt_ns > 0) {
-                double shader_freq_mhz = avg_cyc / rt_ns * 1e3;
-                printf("    Estimated shader clock: %.1f MHz\n", shader_freq_mhz);
-                printf("    (assuming s_memrealtime runs at %.1f MHz)\n",
-                       (double)g_sys_freq / 1e6);
-            }
-        }
+        printf("  (assuming s_memrealtime runs at %.1f MHz)\n",
+               (double)g_sys_freq / 1e6);
     }
 
     /* ── 9. Final summary ── */
