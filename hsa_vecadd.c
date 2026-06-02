@@ -23,7 +23,9 @@
  * Build:  gcc -O2 -I/opt/rocm/include -L/opt/rocm/lib
  *             -Wl,-rpath,/opt/rocm/lib -o hsa_vecadd hsa_vecadd.c
  *             -lhsa-runtime64 -lm
- * Usage:  ./hsa_vecadd [num_dispatches] [num_elements]
+ * Usage:  ./hsa_vecadd [num_dispatches] [--no-fence]
+ *   num_dispatches: Number of kernel dispatches (default: 10)
+ *   --no-fence:     Use HSA_FENCE_SCOPE_NONE instead of HSA_FENCE_SCOPE_SYSTEM
  */
 
 #include <stdio.h>
@@ -145,6 +147,7 @@ static hsa_amd_memory_pool_t    g_kernarg_pool;
 static hsa_amd_memory_pool_t    g_vram_pool;
 static int                      g_have_vram = 0;
 static uint64_t                 g_sys_freq  = 0;
+static hsa_fence_scope_t        g_fence_scope = HSA_FENCE_SCOPE_SYSTEM;
 
 /* ── Agent discovery callbacks ──────────────────────────────────── */
 
@@ -410,8 +413,8 @@ static void dispatch_one(hsa_queue_t *queue, const kernel_info_t *ki,
     uint16_t header =
         (HSA_PACKET_TYPE_KERNEL_DISPATCH << HSA_PACKET_HEADER_TYPE)
       | (1 << HSA_PACKET_HEADER_BARRIER)
-      | (HSA_FENCE_SCOPE_SYSTEM << HSA_PACKET_HEADER_ACQUIRE_FENCE_SCOPE)
-      | (HSA_FENCE_SCOPE_SYSTEM << HSA_PACKET_HEADER_RELEASE_FENCE_SCOPE);
+      | (g_fence_scope << HSA_PACKET_HEADER_ACQUIRE_FENCE_SCOPE)
+      | (g_fence_scope << HSA_PACKET_HEADER_RELEASE_FENCE_SCOPE);
     uint16_t setup = 1;  /* 1D */
 
     packet_store_release((uint32_t *)pkt, header, setup);
@@ -721,18 +724,32 @@ int main(int argc, char **argv) {
     setbuf(stderr, NULL);
 
     int num_runs = DEFAULT_RUNS;
-    if (argc > 1) num_runs = atoi(argv[1]);
-    if (num_runs < 1) num_runs = 1;
+
+    /* Parse command line arguments */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--no-fence") == 0) {
+            g_fence_scope = HSA_FENCE_SCOPE_NONE;
+        } else {
+            /* Try to parse as number of runs */
+            int val = atoi(argv[i]);
+            if (val > 0) {
+                num_runs = val;
+            }
+        }
+    }
 
     /* Force exactly 8 workgroups */
     uint32_t num_groups = NUM_WORKGROUPS;
     int N = WORKGROUP_SIZE * num_groups;
 
+    const char *fence_str = (g_fence_scope == HSA_FENCE_SCOPE_NONE) ? "NONE" : "SYSTEM";
+
     printf("╔══════════════════════════════════════════════════════════╗\n");
     printf("║  Bare-Metal HSA Timestamp Validation Test (Zero HIP)   ║\n");
     printf("╚══════════════════════════════════════════════════════════╝\n\n");
-    printf("N=%d  workgroup_size=%d  num_groups=%u  dispatches=%d\n\n",
+    printf("N=%d  workgroup_size=%d  num_groups=%u  dispatches=%d\n",
            N, WORKGROUP_SIZE, num_groups, num_runs);
+    printf("Fence scope: %s\n\n", fence_str);
 
     /* ── 1. Init HSA ── */
     init_hsa();
@@ -788,20 +805,24 @@ int main(int argc, char **argv) {
         memset(C, 0, data_bytes);
         run_sequential(queue, &ki, A, B, C, N, num_groups, 1, &dummy);
 
-        int ok = 1;
-        for (int i = 0; i < N; i++) {
-            float expected = (float)i + (float)(N - i);
-            if (fabsf(C[i] - expected) > 1e-5f) {
-                printf("  MISMATCH at [%d]: got %f, expected %f\n",
-                       i, C[i], expected);
-                ok = 0;
-                if (i >= 10) break;
+        if (g_fence_scope == HSA_FENCE_SCOPE_NONE) {
+            printf("  Correctness: SKIPPED (--no-fence mode)\n\n");
+        } else {
+            int ok = 1;
+            for (int i = 0; i < N; i++) {
+                float expected = (float)i + (float)(N - i);
+                if (fabsf(C[i] - expected) > 1e-5f) {
+                    printf("  MISMATCH at [%d]: got %f, expected %f\n",
+                           i, C[i], expected);
+                    ok = 0;
+                    if (i >= 10) break;
+                }
             }
-        }
-        printf("  Correctness: %s\n\n", ok ? "PASS" : "FAIL");
-        if (!ok) {
-            fprintf(stderr, "Kernel produced wrong results — aborting.\n");
-            exit(1);
+            printf("  Correctness: %s\n\n", ok ? "PASS" : "FAIL");
+            if (!ok) {
+                fprintf(stderr, "Kernel produced wrong results — aborting.\n");
+                exit(1);
+            }
         }
     }
 
