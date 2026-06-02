@@ -93,6 +93,7 @@ typedef struct {
     uint64_t cp_end;
 
     /* Shader dual-clock measurements (per-chiplet, 8 chiplets) */
+    uint32_t chiplet_xcc_id[NUM_WORKGROUPS];
     uint64_t chiplet_realtime_1[NUM_WORKGROUPS];
     uint64_t chiplet_cycles_1[NUM_WORKGROUPS];
     uint64_t chiplet_realtime_2[NUM_WORKGROUPS];
@@ -124,15 +125,15 @@ typedef struct {
  *   offset 32: uint32_t N            (4 bytes)
  *   total: 36 bytes (no HIP implicit arguments)
  *
- * ts_shader buffer layout (32 uint64_t values, 8 workgroups × 4 values):
- *   Workgroup 0 (chiplet 0): [0..3]   = realtime_1, cycles_1, realtime_2, cycles_2
- *   Workgroup 1 (chiplet 1): [4..7]   = realtime_1, cycles_1, realtime_2, cycles_2
- *   Workgroup 2 (chiplet 2): [8..11]  = realtime_1, cycles_1, realtime_2, cycles_2
- *   Workgroup 3 (chiplet 3): [12..15] = realtime_1, cycles_1, realtime_2, cycles_2
- *   Workgroup 4 (chiplet 4): [16..19] = realtime_1, cycles_1, realtime_2, cycles_2
- *   Workgroup 5 (chiplet 5): [20..23] = realtime_1, cycles_1, realtime_2, cycles_2
- *   Workgroup 6 (chiplet 6): [24..27] = realtime_1, cycles_1, realtime_2, cycles_2
- *   Workgroup 7 (chiplet 7): [28..31] = realtime_1, cycles_1, realtime_2, cycles_2
+ * ts_shader buffer layout (40 uint64_t values, 8 workgroups × 5 values):
+ *   Workgroup 0: [0..4]   = xcc_id, realtime_1, cycles_1, realtime_2, cycles_2
+ *   Workgroup 1: [5..9]   = xcc_id, realtime_1, cycles_1, realtime_2, cycles_2
+ *   Workgroup 2: [10..14] = xcc_id, realtime_1, cycles_1, realtime_2, cycles_2
+ *   Workgroup 3: [15..19] = xcc_id, realtime_1, cycles_1, realtime_2, cycles_2
+ *   Workgroup 4: [20..24] = xcc_id, realtime_1, cycles_1, realtime_2, cycles_2
+ *   Workgroup 5: [25..29] = xcc_id, realtime_1, cycles_1, realtime_2, cycles_2
+ *   Workgroup 6: [30..34] = xcc_id, realtime_1, cycles_1, realtime_2, cycles_2
+ *   Workgroup 7: [35..39] = xcc_id, realtime_1, cycles_1, realtime_2, cycles_2
  */
 
 /* ── Global state ───────────────────────────────────────────────── */
@@ -423,7 +424,7 @@ static void run_sequential(hsa_queue_t *queue, const kernel_info_t *ki,
                             float *A, float *B, float *C,
                             uint32_t N, uint32_t num_groups,
                             int num_runs, ts_record_t *records) {
-    size_t ts_bytes = num_groups * 4 * sizeof(uint64_t);  /* 8 workgroups × 4 values each */
+    size_t ts_bytes = num_groups * 5 * sizeof(uint64_t);  /* 8 workgroups × 5 values each */
 
     for (int r = 0; r < num_runs; r++) {
         /* Per-dispatch shader timestamp buffer */
@@ -469,11 +470,12 @@ static void run_sequential(hsa_queue_t *queue, const kernel_info_t *ki,
 
         /* Timestamp point 3: shader dual-clock measurements (per-chiplet) */
         for (uint32_t wg = 0; wg < num_groups; wg++) {
-            uint32_t base_offset = wg * 4;
-            records[r].chiplet_realtime_1[wg] = ts_shader[base_offset + 0];
-            records[r].chiplet_cycles_1[wg]   = ts_shader[base_offset + 1];
-            records[r].chiplet_realtime_2[wg] = ts_shader[base_offset + 2];
-            records[r].chiplet_cycles_2[wg]   = ts_shader[base_offset + 3];
+            uint32_t base_offset = wg * 5;
+            records[r].chiplet_xcc_id[wg]     = (uint32_t)ts_shader[base_offset + 0];
+            records[r].chiplet_realtime_1[wg] = ts_shader[base_offset + 1];
+            records[r].chiplet_cycles_1[wg]   = ts_shader[base_offset + 2];
+            records[r].chiplet_realtime_2[wg] = ts_shader[base_offset + 3];
+            records[r].chiplet_cycles_2[wg]   = ts_shader[base_offset + 4];
         }
 
         hsa_signal_destroy(signal);
@@ -488,7 +490,7 @@ static void run_burst(hsa_queue_t *queue, const kernel_info_t *ki,
                        float *A, float *B, float *C,
                        uint32_t N, uint32_t num_groups,
                        int num_runs, ts_record_t *records) {
-    size_t ts_bytes = num_groups * 4 * sizeof(uint64_t);  /* 8 workgroups × 4 values each */
+    size_t ts_bytes = num_groups * 5 * sizeof(uint64_t);  /* 8 workgroups × 5 values each */
 
     hsa_signal_t *signals  = calloc(num_runs, sizeof(hsa_signal_t));
     void        **kernargs = calloc(num_runs, sizeof(void *));
@@ -543,11 +545,12 @@ static void run_burst(hsa_queue_t *queue, const kernel_info_t *ki,
 
         /* Shader dual-clock measurements (per-chiplet) */
         for (uint32_t wg = 0; wg < num_groups; wg++) {
-            uint32_t base_offset = wg * 4;
-            records[r].chiplet_realtime_1[wg] = ts_bufs[r][base_offset + 0];
-            records[r].chiplet_cycles_1[wg]   = ts_bufs[r][base_offset + 1];
-            records[r].chiplet_realtime_2[wg] = ts_bufs[r][base_offset + 2];
-            records[r].chiplet_cycles_2[wg]   = ts_bufs[r][base_offset + 3];
+            uint32_t base_offset = wg * 5;
+            records[r].chiplet_xcc_id[wg]     = (uint32_t)ts_bufs[r][base_offset + 0];
+            records[r].chiplet_realtime_1[wg] = ts_bufs[r][base_offset + 1];
+            records[r].chiplet_cycles_1[wg]   = ts_bufs[r][base_offset + 2];
+            records[r].chiplet_realtime_2[wg] = ts_bufs[r][base_offset + 3];
+            records[r].chiplet_cycles_2[wg]   = ts_bufs[r][base_offset + 4];
         }
     }
 
@@ -592,7 +595,7 @@ static void print_records(const ts_record_t *recs, int n) {
 
     printf("  %4s  %20s  %20s  %10s  ", "Run", "CP_start", "CP_end", "CP(us)");
     for (int c = 0; c < NUM_WORKGROUPS; c++) {
-        printf("  C%d_RT_Δ  C%d_CYC_Δ", c, c);
+        printf("  X%d_RT_Δ  X%d_CYC_Δ", c, c);
     }
     printf("\n");
 
@@ -621,10 +624,11 @@ static void print_dual_clock_detail(const ts_record_t *rec, int run_num) {
     printf("    delta = %lu ticks\n\n", rec->cp_end - rec->cp_start);
 
     printf("  Per-Chiplet Shader Timestamps:\n");
-    printf("  %7s  %15s  %20s  %20s  %20s  %20s  %15s  %15s  %12s\n",
-           "Chiplet", "CP→RT_1", "RT_1", "CYC_1", "RT_2", "CYC_2", "RT_Δ", "CYC_Δ", "CYC/RT");
+    printf("  %4s  %6s  %15s  %20s  %20s  %20s  %20s  %15s  %15s  %12s\n",
+           "WG", "XCC_ID", "CP→RT_1", "RT_1", "CYC_1", "RT_2", "CYC_2", "RT_Δ", "CYC_Δ", "CYC/RT");
 
     for (int c = 0; c < NUM_WORKGROUPS; c++) {
+        uint32_t xcc_id = rec->chiplet_xcc_id[c];
         uint64_t rt1 = rec->chiplet_realtime_1[c];
         uint64_t cyc1 = rec->chiplet_cycles_1[c];
         uint64_t rt2 = rec->chiplet_realtime_2[c];
@@ -634,8 +638,8 @@ static void print_dual_clock_detail(const ts_record_t *rec, int run_num) {
         uint64_t cyc_delta = cyc2 - cyc1;
         double ratio = (rt_delta > 0) ? (double)cyc_delta / (double)rt_delta : 0.0;
 
-        printf("  %7d  %15ld  %20lu  %20lu  %20lu  %20lu  %15lu  %15lu  %12.6f\n",
-               c, cp_to_rt1, rt1, cyc1, rt2, cyc2, rt_delta, cyc_delta, ratio);
+        printf("  %4d  %6u  %15ld  %20lu  %20lu  %20lu  %20lu  %15lu  %15lu  %12.6f\n",
+               c, xcc_id, cp_to_rt1, rt1, cyc1, rt2, cyc2, rt_delta, cyc_delta, ratio);
     }
 }
 
@@ -886,7 +890,10 @@ int main(int argc, char **argv) {
                 double avg_cyc = (double)sum_cyc_delta / (double)valid_runs;
                 double ratio = avg_cyc / avg_rt;
 
-                printf("\n  Chiplet %d (across %d runs):\n", c, valid_runs);
+                /* Get XCC ID from first run */
+                uint32_t xcc_id = seq_recs[0].chiplet_xcc_id[c];
+
+                printf("\n  Workgroup %d → XCC_ID %u (across %d runs):\n", c, xcc_id, valid_runs);
                 printf("    s_memrealtime delta = %.1f ticks\n", avg_rt);
                 printf("    s_memtime delta     = %.1f cycles\n", avg_cyc);
                 printf("    cycles/realtime ratio = %.6f\n", ratio);

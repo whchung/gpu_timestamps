@@ -8,13 +8,15 @@
  *   __builtin_amdgcn_s_sendmsg_rtnl()   — GPU real-time clock (gfx1250)
  *   __builtin_amdgcn_s_memtime()        — Shader cycles counter (gfx9xx)
  *   __builtin_readcyclecounter()        — Shader cycles counter (gfx1250)
+ *   __builtin_amdgcn_s_getreg()         — Read HW_ID for XCC ID (gfx9xx)
  *
  * Per-chiplet measurement protocol (8 workgroups, 1 per chiplet):
  *   Each workgroup (lane 0 only):
- *   1. Capture REALTIME #1 + SHADER_CYCLES #1 (store locally)
- *   2. Store those out, s_wait_kmcnt, barrier (no other work)
- *   3. Capture REALTIME #2 + SHADER_CYCLES #2
- *   4. Store those out
+ *   1. Capture XCC_ID from hardware
+ *   2. Capture REALTIME #1 + SHADER_CYCLES #1 (store locally)
+ *   3. Store those out, s_wait_kmcnt, barrier (no other work)
+ *   4. Capture REALTIME #2 + SHADER_CYCLES #2
+ *   5. Store those out
  *
  * Compile (gfx950):
  *   clang --target=amdgcn-amd-amdhsa -mcpu=gfx950 -O2 -c -o vecadd_kernel.o vecadd_kernel.c
@@ -41,6 +43,17 @@ void vecadd_timestamp(
 
     /* Each workgroup (lane 0 only) captures dual timestamps for its chiplet */
     if (wi_id == 0) {
+        /* Get actual XCC ID from hardware */
+#if defined(__gfx950__) || defined(__gfx942__) || defined(__gfx908__) || defined(__gfx900__)
+        /* Read XCC_ID directly using s_getreg_b32
+         * SIMM16[5:0]=hwRegId, SIMM16[10:6]=offset, SIMM16[15:11]=size-1
+         * hwRegId=20, offset=0, size=4 => ((4-1)<<11) | (0<<6) | 20 = 0x1814 */
+        uint32_t xcc_id = __builtin_amdgcn_s_getreg(0x1814);
+#elif defined(__gfx1250__)
+        /* Use S_SENDMSG_RTN RTN_GET_SE_HW_ID (0x87), bits [19:16] contain XCC ID */
+        uint32_t xcc_id = (__builtin_amdgcn_s_sendmsg_rtn(0x87) >> 16) & 0xF;
+#endif
+
         /* Measurement #1: REALTIME and SHADER_CYCLES (store locally) */
 #if defined(__gfx950__) || defined(__gfx942__) || defined(__gfx908__) || defined(__gfx900__)
         uint64_t realtime_1 = __builtin_amdgcn_s_memrealtime();
@@ -50,10 +63,11 @@ void vecadd_timestamp(
         uint64_t cycles_1   = __builtin_readcyclecounter();
 #endif
 
-        /* Store first pair (each workgroup uses offset wg_id * 4) */
-        uint32_t base_offset = wg_id * 4;
-        ts_shader[base_offset + 0] = realtime_1;
-        ts_shader[base_offset + 1] = cycles_1;
+        /* Store XCC_ID and first pair (each workgroup uses offset wg_id * 5) */
+        uint32_t base_offset = wg_id * 5;
+        ts_shader[base_offset + 0] = xcc_id;
+        ts_shader[base_offset + 1] = realtime_1;
+        ts_shader[base_offset + 2] = cycles_1;
 
         /* Wait for stores to complete */
 #if defined(__gfx950__) || defined(__gfx942__) || defined(__gfx908__) || defined(__gfx900__)
@@ -75,8 +89,8 @@ void vecadd_timestamp(
 #endif
 
         /* Store second pair */
-        ts_shader[base_offset + 2] = realtime_2;
-        ts_shader[base_offset + 3] = cycles_2;
+        ts_shader[base_offset + 3] = realtime_2;
+        ts_shader[base_offset + 4] = cycles_2;
     }
 
     /* Optional: still do the vector add for functional testing */
