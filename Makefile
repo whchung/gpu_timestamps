@@ -1,7 +1,18 @@
 ROCM     ?= /opt/rocm
 CLANG    := $(ROCM)/lib/llvm/bin/clang
 LLD      := $(ROCM)/lib/llvm/bin/ld.lld
-GPU_ARCH ?= gfx950
+
+# Auto-detect GPU_ARCH from rocm_agent_enumerator if available
+ifeq ($(GPU_ARCH),)
+  DETECTED_GPU := $(shell $(ROCM)/bin/rocm_agent_enumerator -t GPU 2>/dev/null | head -n1)
+  ifneq ($(DETECTED_GPU),)
+    GPU_ARCH := $(DETECTED_GPU)
+  else
+    GPU_ARCH := gfx950
+  endif
+else
+  # Allow override from command line or environment
+endif
 
 HSA_INC  := $(ROCM)/include
 HSA_LIB  := $(ROCM)/lib
