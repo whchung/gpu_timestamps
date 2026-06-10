@@ -641,10 +641,30 @@ static void sdma_copy_profiled(void *dst, hsa_agent_t dst_agent,
     hsa_signal_destroy(signal);
 }
 
+/* ── Comparison function for sorting by RT_1 (chiplet_realtime_1[0]) ── */
+
+static int compare_by_rt1(const void *a, const void *b) {
+    const ts_record_t *rec_a = (const ts_record_t *)a;
+    const ts_record_t *rec_b = (const ts_record_t *)b;
+    uint64_t rt1_a = rec_a->chiplet_realtime_1[0];
+    uint64_t rt1_b = rec_b->chiplet_realtime_1[0];
+
+    if (rt1_a < rt1_b) return -1;
+    if (rt1_a > rt1_b) return 1;
+    return 0;
+}
+
 /* ── Print records ──────────────────────────────────────────────── */
 
 static void print_records(const ts_record_t *recs, int n) {
     double to_us = 1e6 / (double)g_sys_freq;
+
+    /* Create a copy of records to sort without modifying the original */
+    ts_record_t *sorted_recs = malloc(n * sizeof(ts_record_t));
+    memcpy(sorted_recs, recs, n * sizeof(ts_record_t));
+
+    /* Sort by RT_1 (chiplet_realtime_1[0]) in ascending order */
+    qsort(sorted_recs, n, sizeof(ts_record_t), compare_by_rt1);
 
     printf("  %4s  %20s  %20s  %10s  ", "Run", "CP_start", "CP_end", "CP(us)");
     for (int c = 0; c < NUM_WORKGROUPS; c++) {
@@ -653,7 +673,7 @@ static void print_records(const ts_record_t *recs, int n) {
     printf("\n");
 
     for (int i = 0; i < n; i++) {
-        const ts_record_t *r = &recs[i];
+        const ts_record_t *r = &sorted_recs[i];
         double cp_dur = (double)(r->cp_end - r->cp_start) * to_us;
 
         printf("  %4d  %20lu  %20lu  %10.1f  ", i, r->cp_start, r->cp_end, cp_dur);
@@ -665,6 +685,23 @@ static void print_records(const ts_record_t *recs, int n) {
         }
         printf("\n");
     }
+
+    free(sorted_recs);
+}
+
+/* ── Helper structure for sorting chiplets by RT_1 ─────────────── */
+
+typedef struct {
+    int wg_index;
+    uint64_t rt1;
+} chiplet_sort_t;
+
+static int compare_chiplets_by_rt1(const void *a, const void *b) {
+    const chiplet_sort_t *ca = (const chiplet_sort_t *)a;
+    const chiplet_sort_t *cb = (const chiplet_sort_t *)b;
+    if (ca->rt1 < cb->rt1) return -1;
+    if (ca->rt1 > cb->rt1) return 1;
+    return 0;
 }
 
 /* ── Print detailed dual-clock measurements ─────────────────────── */
@@ -677,22 +714,43 @@ static void print_dual_clock_detail(const ts_record_t *rec, int run_num) {
     printf("    delta = %lu ticks\n\n", rec->cp_end - rec->cp_start);
 
     printf("  Per-Chiplet Shader Timestamps:\n");
-    printf("  %4s  %6s  %15s  %20s  %20s  %20s  %20s  %15s  %15s  %12s\n",
-           "WG", "XCC_ID", "CP→RT_1", "RT_1", "CYC_1", "RT_2", "CYC_2", "RT_Δ", "CYC_Δ", "CYC/RT");
+    printf("  %4s  %6s  %15s  %20s  %20s  %20s  %15s  %20s  %20s  %20s  %15s  %15s  %12s\n",
+           "WG", "XCC_ID", "CP→RT_1", "CP→RT_1-CP→RT_1[0]", "Diff", "RT_1", "RT_1-RT_1[0]", "CYC_1", "RT_2", "CYC_2", "RT_Δ", "CYC_Δ", "CYC/RT");
 
+    /* Create array for sorting chiplets by RT_1 */
+    chiplet_sort_t sorted_chiplets[NUM_WORKGROUPS];
     for (int c = 0; c < NUM_WORKGROUPS; c++) {
+        sorted_chiplets[c].wg_index = c;
+        sorted_chiplets[c].rt1 = rec->chiplet_realtime_1[c];
+    }
+
+    /* Sort by RT_1 in ascending order */
+    qsort(sorted_chiplets, NUM_WORKGROUPS, sizeof(chiplet_sort_t), compare_chiplets_by_rt1);
+
+    /* Get the first (minimum) RT_1 value after sorting */
+    uint64_t first_rt1 = sorted_chiplets[0].rt1;
+
+    /* Calculate the first CP→RT_1 value */
+    int first_c = sorted_chiplets[0].wg_index;
+    int64_t first_cp_to_rt1 = (int64_t)rec->chiplet_realtime_1[first_c] - (int64_t)rec->cp_start;
+
+    for (int i = 0; i < NUM_WORKGROUPS; i++) {
+        int c = sorted_chiplets[i].wg_index;
         uint32_t xcc_id = rec->chiplet_xcc_id[c];
         uint64_t rt1 = rec->chiplet_realtime_1[c];
         uint64_t cyc1 = rec->chiplet_cycles_1[c];
         uint64_t rt2 = rec->chiplet_realtime_2[c];
         uint64_t cyc2 = rec->chiplet_cycles_2[c];
         int64_t cp_to_rt1 = (int64_t)rt1 - (int64_t)rec->cp_start;
+        int64_t cp_to_rt1_diff = cp_to_rt1 - first_cp_to_rt1;  /* Difference from first CP→RT_1 */
+        int64_t col_diff = cp_to_rt1 - cp_to_rt1_diff;  /* Diff between CP→RT_1 and CP→RT_1-CP→RT_1[0] */
+        uint64_t rt1_diff = rt1 - first_rt1;  /* Difference from first RT_1 */
         uint64_t rt_delta = rt2 - rt1;
         uint64_t cyc_delta = cyc2 - cyc1;
         double ratio = (rt_delta > 0) ? (double)cyc_delta / (double)rt_delta : 0.0;
 
-        printf("  %4d  %6u  %15ld  %20lu  %20lu  %20lu  %20lu  %15lu  %15lu  %12.6f\n",
-               c, xcc_id, cp_to_rt1, rt1, cyc1, rt2, cyc2, rt_delta, cyc_delta, ratio);
+        printf("  %4d  %6u  %15ld  %20ld  %20ld  %20lu  %15lu  %20lu  %20lu  %20lu  %15lu  %15lu  %12.6f\n",
+               c, xcc_id, cp_to_rt1, cp_to_rt1_diff, col_diff, rt1, rt1_diff, cyc1, rt2, cyc2, rt_delta, cyc_delta, ratio);
     }
 }
 
