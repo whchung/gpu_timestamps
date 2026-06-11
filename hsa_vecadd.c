@@ -714,8 +714,8 @@ static void print_dual_clock_detail(const ts_record_t *rec, int run_num) {
     printf("    delta = %lu ticks\n\n", rec->cp_end - rec->cp_start);
 
     printf("  Per-Chiplet Shader Timestamps:\n");
-    printf("  %4s  %6s  %15s  %20s  %20s  %20s  %15s  %20s  %20s  %20s  %15s  %15s  %12s\n",
-           "WG", "XCC_ID", "CP→RT_1", "CP→RT_1-CP→RT_1[0]", "Diff", "RT_1", "RT_1-RT_1[0]", "CYC_1", "RT_2", "CYC_2", "RT_Δ", "CYC_Δ", "CYC/RT");
+    printf("  %4s  %6s  %15s  %20s  %20s  %15s  %20s  %20s  %20s  %15s  %15s  %12s\n",
+           "WG", "XCC_ID", "CP→RT_1", "CP→RT_1-CP→RT_1[0]", "RT_1", "RT_1-RT_1[0]", "CYC_1", "RT_2", "CYC_2", "RT_Δ", "CYC_Δ", "CYC/RT");
 
     /* Create array for sorting chiplets by RT_1 */
     chiplet_sort_t sorted_chiplets[NUM_WORKGROUPS];
@@ -743,14 +743,13 @@ static void print_dual_clock_detail(const ts_record_t *rec, int run_num) {
         uint64_t cyc2 = rec->chiplet_cycles_2[c];
         int64_t cp_to_rt1 = (int64_t)rt1 - (int64_t)rec->cp_start;
         int64_t cp_to_rt1_diff = cp_to_rt1 - first_cp_to_rt1;  /* Difference from first CP→RT_1 */
-        int64_t col_diff = cp_to_rt1 - cp_to_rt1_diff;  /* Diff between CP→RT_1 and CP→RT_1-CP→RT_1[0] */
         uint64_t rt1_diff = rt1 - first_rt1;  /* Difference from first RT_1 */
         uint64_t rt_delta = rt2 - rt1;
         uint64_t cyc_delta = cyc2 - cyc1;
         double ratio = (rt_delta > 0) ? (double)cyc_delta / (double)rt_delta : 0.0;
 
-        printf("  %4d  %6u  %15ld  %20ld  %20ld  %20lu  %15lu  %20lu  %20lu  %20lu  %15lu  %15lu  %12.6f\n",
-               c, xcc_id, cp_to_rt1, cp_to_rt1_diff, col_diff, rt1, rt1_diff, cyc1, rt2, cyc2, rt_delta, cyc_delta, ratio);
+        printf("  %4d  %6u  %15ld  %20ld  %20lu  %15lu  %20lu  %20lu  %20lu  %15lu  %15lu  %12.6f\n",
+               c, xcc_id, cp_to_rt1, cp_to_rt1_diff, rt1, rt1_diff, cyc1, rt2, cyc2, rt_delta, cyc_delta, ratio);
     }
 }
 
