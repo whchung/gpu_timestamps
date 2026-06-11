@@ -22,7 +22,7 @@ all: vecadd_kernel.co hsa_vecadd
 # Kernel: pure C → amdgcn object → shared ELF code object
 # Uses only hardware intrinsics + s_memrealtime, zero HIP dependency.
 vecadd_kernel.o: vecadd_kernel.c
-	$(CLANG) --target=amdgcn-amd-amdhsa -mcpu=$(GPU_ARCH) -DGPU_ARCH=$(GPU_ARCH) -O2 -c -o $@ $<
+	$(CLANG) --target=amdgcn-amd-amdhsa -mcpu=$(GPU_ARCH) -DGPU_ARCH=$(GPU_ARCH) -mllvm --amdgpu-kernarg-preload-count=32 -O2 -c -o $@ $<
 
 vecadd_kernel.co: vecadd_kernel.o
 	$(LLD) -shared -o $@ $<
