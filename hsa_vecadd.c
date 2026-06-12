@@ -44,11 +44,10 @@
 /* ── AMD signal structure (for direct timestamp access) ─────────── */
 
 typedef struct {
-    int32_t  kind;
+    int64_t  kind;
     union {
-        volatile int32_t value;
-        volatile uint32_t raw32[2];
-        volatile uint64_t raw64;
+        volatile int64_t value;
+        volatile uint64_t* hardware_doorbell_ptr;
     };
     uint64_t event_mailbox_ptr;
     uint32_t event_id;
@@ -56,10 +55,26 @@ typedef struct {
     uint64_t start_ts;
     uint64_t end_ts;
     union {
-        void *queue_ptr;
-        uint64_t raw64_1;
+        void* queue_ptr;
+        uint64_t reserved2;
     };
-    uint32_t reserved2[2];
+    uint32_t reserved3[2];
+    /* Debug-only per-XCC dispatch start timestamps (MI450, 8 XCCs/chiplets).
+     * The master CP on XCC0 records start_ts/end_ts above; because XCC0 observes
+     * work later than the chiplet that actually launched it, start_ts can be
+     * reported too late. To investigate this each XCC's CP additionally records
+     * the low 16 bits of its own dispatch-start RTC sample (100 MHz, 10 ns/tick)
+     * here. These fields are appended after reserved3 so the frozen offsets of
+     * start_ts/end_ts (and all preceding fields) are unchanged. They are purely
+     * for debug inspection and are NOT consumed by the runtime timing path. The
+     * SDMA path does not write them. A slot of 0 means the corresponding XCC did
+     * not record a sample. Reconstruct each XCC's absolute start against start_ts
+     * via modular signed subtraction (exact to 10 ns while |skew| < 327.68 us):
+     *   int16_t d = (int16_t)(xcc_start_ts_lo[i] - (uint16_t)start_ts);
+     *   uint64_t xcc_abs = start_ts + d;
+     */
+    uint16_t xcc_start_ts_lo[8];
+    uint32_t reserved4[12];
 } amd_signal_t;
 
 /* ── Configuration ──────────────────────────────────────────────── */
@@ -93,6 +108,9 @@ typedef struct {
 
     uint64_t cp_start;
     uint64_t cp_end;
+
+    /* Per-XCC CP start timestamps (low 16 bits from signal structure) */
+    uint16_t xcc_start_ts_lo[8];
 
     /* Shader dual-clock measurements (per-chiplet, 8 chiplets) */
     uint32_t chiplet_xcc_id[NUM_WORKGROUPS];
@@ -507,6 +525,11 @@ static void run_sequential(hsa_queue_t *queue, const kernel_info_t *ki,
         records[r].cp_start = amd_sig->start_ts;
         records[r].cp_end   = amd_sig->end_ts;
 
+        /* Per-XCC CP start timestamps (low 16 bits) */
+        for (int xcc = 0; xcc < 8; xcc++) {
+            records[r].xcc_start_ts_lo[xcc] = amd_sig->xcc_start_ts_lo[xcc];
+        }
+
         /* Timestamp point 3: shader dual-clock measurements (per-chiplet) */
         for (uint32_t wg = 0; wg < num_groups; wg++) {
             uint32_t base_offset = wg * 5;
@@ -595,6 +618,11 @@ static void run_burst(hsa_queue_t *queue, const kernel_info_t *ki,
         amd_signal_t *amd_sig = (amd_signal_t *)signals[r].handle;
         records[r].cp_start = amd_sig->start_ts;
         records[r].cp_end   = amd_sig->end_ts;
+
+        /* Per-XCC CP start timestamps (low 16 bits) */
+        for (int xcc = 0; xcc < 8; xcc++) {
+            records[r].xcc_start_ts_lo[xcc] = amd_sig->xcc_start_ts_lo[xcc];
+        }
 
         /* Shader dual-clock measurements (per-chiplet) */
         for (uint32_t wg = 0; wg < num_groups; wg++) {
@@ -750,6 +778,38 @@ static void print_dual_clock_detail(const ts_record_t *rec, int run_num) {
 
         printf("  %4d  %6u  %15ld  %20ld  %20lu  %15lu  %20lu  %20lu  %20lu  %15lu  %15lu  %12.6f\n",
                c, xcc_id, cp_to_rt1, cp_to_rt1_diff, rt1, rt1_diff, cyc1, rt2, cyc2, rt_delta, cyc_delta, ratio);
+    }
+}
+
+/* ── Print per-XCC CP start timestamps ─────────────────────────── */
+
+static void print_xcc_timestamps(const ts_record_t *rec, int run_num) {
+    printf("\n━━━ Run %d: Per-XCC CP Dispatch Start Timestamps ━━━\n", run_num);
+    printf("  CP start_ts (master XCC0) = %lu\n", rec->cp_start);
+    printf("  CP end_ts   (master XCC0) = %lu\n\n", rec->cp_end);
+
+    printf("  Per-XCC CP start timestamp reconstruction:\n");
+    printf("  %4s  %10s  %20s  %20s  %20s\n",
+           "XCC", "lo_16bits", "Reconstructed (abs)", "Δ from master", "Δ (ns)");
+
+    double to_ns = 1e9 / (double)g_sys_freq;
+
+    for (int xcc = 0; xcc < 8; xcc++) {
+        uint16_t lo16 = rec->xcc_start_ts_lo[xcc];
+
+        if (lo16 == 0) {
+            printf("  %4d  %10s  %20s  %20s  %20s\n",
+                   xcc, "0", "N/A", "N/A", "N/A");
+        } else {
+            /* Reconstruct absolute timestamp via modular signed subtraction */
+            int16_t delta = (int16_t)(lo16 - (uint16_t)rec->cp_start);
+            uint64_t xcc_abs = rec->cp_start + delta;
+            int64_t diff_from_master = (int64_t)xcc_abs - (int64_t)rec->cp_start;
+            double diff_ns = (double)diff_from_master * to_ns;
+
+            printf("  %4d  %10u  %20lu  %20ld  %20.1f\n",
+                   xcc, lo16, xcc_abs, diff_from_master, diff_ns);
+        }
     }
 }
 
@@ -941,8 +1001,9 @@ int main(int argc, char **argv) {
     run_sequential(queue, &ki, A, B, C, N, num_groups, num_runs, seq_recs);
     print_records(seq_recs, num_runs);
 
-    /* Print dual-clock detail for all runs */
+    /* Print dual-clock detail and XCC timestamps for all runs */
     for (int r = 0; r < num_runs; r++) {
+        print_xcc_timestamps(&seq_recs[r], r);
         print_dual_clock_detail(&seq_recs[r], r);
     }
 
@@ -970,8 +1031,9 @@ int main(int argc, char **argv) {
     run_burst(queue, &ki, A, B, C, N, num_groups, num_runs, burst_recs);
     print_records(burst_recs, num_runs);
 
-    /* Print dual-clock detail for all runs */
+    /* Print dual-clock detail and XCC timestamps for all runs */
     for (int r = 0; r < num_runs; r++) {
+        print_xcc_timestamps(&burst_recs[r], r);
         print_dual_clock_detail(&burst_recs[r], r);
     }
 
